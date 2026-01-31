@@ -1,0 +1,6 @@
+build/
+trace.csv
+*.o
+example_program
+cache_sim
+unit_tests

@@ -1,0 +1,23 @@
+name: Cache Simulator Tests
+
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libyaml-cpp-dev cmake g++
+      - name: Configure and Build
+        run: |
+          mkdir build
+          cd build
+          cmake ..
+          make
+      - name: Run Unit Tests
+        run: ./build/unit_tests
+      - name: Run Example Program
+        run: ./build/example_program
+      - name: Run Trace Simulation
+        run: ./build/cache_sim configs/default.yaml tests/multi_core.trace
