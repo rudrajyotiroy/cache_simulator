@@ -10,7 +10,6 @@ include_directories(include)
 
 # Simulator library
 add_library(simulator_lib
-    src/replacement_policy.cpp
     src/cache.cpp
     src/cache_state.cpp
     src/write_policy.cpp

@@ -5,6 +5,14 @@
 
 namespace sim {
 
+/**
+ * @file cache_state.cpp
+ * @brief Implementation of the MSI protocol states.
+ *
+ * Each class represents a state in the MSI state machine.
+ * States handle core events (Read, Write, Replacement) and network events (Data, Ack, etc.).
+ */
+
 class IState : public MSIState {
 public:
     std::string name() const override { return "I"; }
@@ -22,6 +30,7 @@ public:
     void onData(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onInv(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
+        // Send ACK even if in Invalid state (for protocol robustness)
         sys->network.send(Message(MessageType::ACK, cache->id, msg.sender_id, msg.address), [sys](Message m){ sys->handleMessage(m); });
     }
     void onFwdGets(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
@@ -33,6 +42,7 @@ class SState : public MSIState {
 public:
     std::string name() const override { return "S"; }
     void onRead(Cache* cache, CacheLine* line, System* sys) override {
+        // Hit in S: notify core after lookup latency
         if (line->on_fill) {
             auto cb = line->on_fill;
             line->on_fill = nullptr;
@@ -42,17 +52,20 @@ public:
         }
     }
     void onWrite(Cache* cache, CacheLine* line, System* sys) override {
+        // Upgrade request (S -> M)
         line->pending_access = CoreAccess::WRITE;
         line->state = Cache::getIMAState();
         sys->network.send(Message(MessageType::GETM, cache->id, cache->next_level_id, line->addr), [sys](Message m){ sys->handleMessage(m); });
     }
     void onReplacement(Cache* cache, CacheLine* line, System* sys) override {
+        // Shared line eviction
         line->state = Cache::getSIAState();
         sys->network.send(Message(MessageType::PUTS, cache->id, cache->next_level_id, line->addr), [sys](Message m){ sys->handleMessage(m); });
     }
     void onData(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onInv(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
+        // Invalidation from Directory
         line->state = Cache::getIState();
         sys->network.send(Message(MessageType::ACK, cache->id, msg.sender_id, msg.address), [sys](Message m){ sys->handleMessage(m); });
     }
@@ -65,6 +78,7 @@ class MState : public MSIState {
 public:
     std::string name() const override { return "M"; }
     void onRead(Cache* cache, CacheLine* line, System* sys) override {
+        // Hit in M
         if (line->on_fill) {
             auto cb = line->on_fill;
             line->on_fill = nullptr;
@@ -74,6 +88,7 @@ public:
         }
     }
     void onWrite(Cache* cache, CacheLine* line, System* sys) override {
+        // Write in M: execute write policy (WB sets dirty, WT sends message)
         cache->write_policy->onWrite(cache, line, sys);
         if (line->on_fill) {
             auto cb = line->on_fill;
@@ -84,6 +99,7 @@ public:
         }
     }
     void onReplacement(Cache* cache, CacheLine* line, System* sys) override {
+        // Modified line eviction (write-back)
         line->state = Cache::getMIAState();
         sys->network.send(Message(MessageType::PUTM, cache->id, cache->next_level_id, line->addr), [sys](Message m){ sys->handleMessage(m); });
     }
@@ -91,13 +107,16 @@ public:
     void onAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onInv(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onFwdGets(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
+        // Downgrade M -> S
         line->state = Cache::getSState();
         Message resp(MessageType::DATA, cache->id, msg.sender_id, msg.address);
         resp.resolved_by = cache->level_name;
         sys->network.send(resp, [sys](Message m){ sys->handleMessage(m); });
+        // Also send data back to directory/memory
         sys->network.send(Message(MessageType::DATA, cache->id, 999, msg.address), [sys](Message m){ sys->handleMessage(m); });
     }
     void onFwdGetm(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
+        // Eviction due to another core's write M -> I
         line->state = Cache::getIState();
         Message resp(MessageType::DATA, cache->id, msg.sender_id, msg.address);
         resp.resolved_by = cache->level_name;
@@ -105,6 +124,8 @@ public:
     }
     void onPutAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
 };
+
+// --- Transient States ---
 
 class ISDState : public MSIState {
 public:
@@ -218,6 +239,7 @@ public:
     }
 };
 
+// Static instances for State Pattern
 static IState i_state;
 static SState s_state;
 static MState m_state;

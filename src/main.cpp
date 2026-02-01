@@ -7,6 +7,11 @@
 
 using namespace sim;
 
+/**
+ * @brief Parses a memory trace file and schedules events in the simulator.
+ *
+ * Trace format: <cycle>, <core_id>, <READ|WRITE>, <hex_address>
+ */
 void runTrace(System& sys, const std::string& trace_path) {
     std::ifstream file(trace_path);
     std::string line;
@@ -34,12 +39,14 @@ void runTrace(System& sys, const std::string& trace_path) {
         entries.push_back({cycle, core_id, type, addr});
     }
 
+    // Schedule each entry in the discrete-event scheduler
     for (const auto& e : entries) {
         sys.scheduler.schedule(e.cycle, [&sys, e]() {
             sys.detectMemAccess(e.core_id, e.type, e.addr);
         });
     }
 
+    // Execute simulation
     sys.scheduler.run();
 }
 
@@ -50,10 +57,12 @@ int main(int argc, char** argv) {
     }
 
     try {
+        // Load system configuration from YAML
         YAML::Node config = YAML::LoadFile(argv[1]);
         System sys(config);
 
         if (argc == 3) {
+            // Run the provided trace file
             runTrace(sys, argv[2]);
         } else {
             std::cout << "No trace file provided. System initialized." << std::endl;
