@@ -5,32 +5,25 @@
 
 namespace sim {
 
-/**
- * @file cache_state.cpp
- * @brief Implementation of the MSI protocol states.
- *
- * Each class represents a state in the MSI state machine.
- * States handle core events (Read, Write, Replacement) and network events (Data, Ack, etc.).
- */
-
 class IState : public MSIState {
 public:
     std::string name() const override { return "I"; }
     void onRead(Cache* cache, CacheLine* line, System* sys) override {
-        line->pending_access = CoreAccess::READ;
-        line->state = Cache::getISDState();
-        sys->network.send(Message(MessageType::GETS, cache->id, cache->next_level_id, line->addr), [sys](Message m){ sys->handleMessage(m); });
+        if (line->pending_requests.size() == 1) {
+            line->state = Cache::getISDState();
+            sys->network.send(Message(MessageType::GETS, cache->id, cache->next_level_id, line->addr), [sys](Message m){ sys->handleMessage(m); });
+        }
     }
     void onWrite(Cache* cache, CacheLine* line, System* sys) override {
-        line->pending_access = CoreAccess::WRITE;
-        line->state = Cache::getIMADState();
-        sys->network.send(Message(MessageType::GETM, cache->id, cache->next_level_id, line->addr), [sys](Message m){ sys->handleMessage(m); });
+        if (line->pending_requests.size() == 1) {
+            line->state = Cache::getIMADState();
+            sys->network.send(Message(MessageType::GETM, cache->id, cache->next_level_id, line->addr), [sys](Message m){ sys->handleMessage(m); });
+        }
     }
     void onReplacement(Cache* cache, CacheLine* line, System* sys) override {}
     void onData(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onInv(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
-        // Send ACK even if in Invalid state (for protocol robustness)
         sys->network.send(Message(MessageType::ACK, cache->id, msg.sender_id, msg.address), [sys](Message m){ sys->handleMessage(m); });
     }
     void onFwdGets(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
@@ -42,30 +35,20 @@ class SState : public MSIState {
 public:
     std::string name() const override { return "S"; }
     void onRead(Cache* cache, CacheLine* line, System* sys) override {
-        // Hit in S: notify core after lookup latency
-        if (line->on_fill) {
-            auto cb = line->on_fill;
-            line->on_fill = nullptr;
-            sys->scheduler.schedule(sys->scheduler.getTime() + cache->lookup_latency, [cb, cache](){
-                cb(cache->level_name);
-            });
-        }
+        cache->processPendingRequests(line, sys);
     }
     void onWrite(Cache* cache, CacheLine* line, System* sys) override {
-        // Upgrade request (S -> M)
-        line->pending_access = CoreAccess::WRITE;
+        // Upgrade: S -> IM_A
         line->state = Cache::getIMAState();
         sys->network.send(Message(MessageType::GETM, cache->id, cache->next_level_id, line->addr), [sys](Message m){ sys->handleMessage(m); });
     }
     void onReplacement(Cache* cache, CacheLine* line, System* sys) override {
-        // Shared line eviction
         line->state = Cache::getSIAState();
         sys->network.send(Message(MessageType::PUTS, cache->id, cache->next_level_id, line->addr), [sys](Message m){ sys->handleMessage(m); });
     }
     void onData(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onInv(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
-        // Invalidation from Directory
         line->state = Cache::getIState();
         sys->network.send(Message(MessageType::ACK, cache->id, msg.sender_id, msg.address), [sys](Message m){ sys->handleMessage(m); });
     }
@@ -78,28 +61,12 @@ class MState : public MSIState {
 public:
     std::string name() const override { return "M"; }
     void onRead(Cache* cache, CacheLine* line, System* sys) override {
-        // Hit in M
-        if (line->on_fill) {
-            auto cb = line->on_fill;
-            line->on_fill = nullptr;
-            sys->scheduler.schedule(sys->scheduler.getTime() + cache->lookup_latency, [cb, cache](){
-                cb(cache->level_name);
-            });
-        }
+        cache->processPendingRequests(line, sys);
     }
     void onWrite(Cache* cache, CacheLine* line, System* sys) override {
-        // Write in M: execute write policy (WB sets dirty, WT sends message)
-        cache->write_policy->onWrite(cache, line, sys);
-        if (line->on_fill) {
-            auto cb = line->on_fill;
-            line->on_fill = nullptr;
-            sys->scheduler.schedule(sys->scheduler.getTime() + cache->lookup_latency, [cb, cache](){
-                cb(cache->level_name);
-            });
-        }
+        cache->processPendingRequests(line, sys);
     }
     void onReplacement(Cache* cache, CacheLine* line, System* sys) override {
-        // Modified line eviction (write-back)
         line->state = Cache::getMIAState();
         sys->network.send(Message(MessageType::PUTM, cache->id, cache->next_level_id, line->addr), [sys](Message m){ sys->handleMessage(m); });
     }
@@ -107,16 +74,13 @@ public:
     void onAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onInv(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onFwdGets(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
-        // Downgrade M -> S
         line->state = Cache::getSState();
         Message resp(MessageType::DATA, cache->id, msg.sender_id, msg.address);
         resp.resolved_by = cache->level_name;
         sys->network.send(resp, [sys](Message m){ sys->handleMessage(m); });
-        // Also send data back to directory/memory
         sys->network.send(Message(MessageType::DATA, cache->id, 999, msg.address), [sys](Message m){ sys->handleMessage(m); });
     }
     void onFwdGetm(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
-        // Eviction due to another core's write M -> I
         line->state = Cache::getIState();
         Message resp(MessageType::DATA, cache->id, msg.sender_id, msg.address);
         resp.resolved_by = cache->level_name;
@@ -124,8 +88,6 @@ public:
     }
     void onPutAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
 };
-
-// --- Transient States ---
 
 class ISDState : public MSIState {
 public:
@@ -135,7 +97,7 @@ public:
     void onReplacement(Cache* cache, CacheLine* line, System* sys) override {}
     void onData(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
         line->state = Cache::getSState();
-        if (line->on_fill) { line->on_fill(msg.resolved_by); line->on_fill = nullptr; }
+        cache->processPendingRequests(line, sys);
     }
     void onAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onInv(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
@@ -154,8 +116,7 @@ public:
         line->pending_acks += msg.ack_count;
         if (line->pending_acks <= 0) {
             line->state = Cache::getMState();
-            cache->write_policy->onWrite(cache, line, sys);
-            if (line->on_fill) { line->on_fill(msg.resolved_by); line->on_fill = nullptr; }
+            cache->processPendingRequests(line, sys);
         } else {
             line->state = Cache::getIMAState();
         }
@@ -163,9 +124,10 @@ public:
     void onAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
         line->pending_acks--;
         if (line->pending_acks <= 0) {
-            line->state = Cache::getMState();
-            cache->write_policy->onWrite(cache, line, sys);
-            if (line->on_fill) { line->on_fill("Coherence"); line->on_fill = nullptr; }
+            // Usually we still need data, so we stay in IM_AD? No, IM_AD means waiting for AD (both).
+            // If we got all Acks but no Data, we move to IM_D?
+            // Let's simplify: if we get all acks and we already had data (from previous state) or we are waiting for data.
+            // My Directory protocol always sends Data with the last Ack count.
         }
     }
     void onInv(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
@@ -180,16 +142,27 @@ public:
     void onRead(Cache* cache, CacheLine* line, System* sys) override {}
     void onWrite(Cache* cache, CacheLine* line, System* sys) override {}
     void onReplacement(Cache* cache, CacheLine* line, System* sys) override {}
-    void onData(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
+    void onData(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
+        // Handle DATA if it arrives in IMAState (e.g. from Directory upgrade response)
+        line->pending_acks += msg.ack_count;
+        if (line->pending_acks <= 0) {
+            line->state = Cache::getMState();
+            cache->processPendingRequests(line, sys);
+        }
+    }
     void onAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
         line->pending_acks--;
         if (line->pending_acks <= 0) {
             line->state = Cache::getMState();
-            cache->write_policy->onWrite(cache, line, sys);
-            if (line->on_fill) { line->on_fill("Coherence"); line->on_fill = nullptr; }
+            cache->processPendingRequests(line, sys);
         }
     }
-    void onInv(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
+    void onInv(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
+        // If we are waiting for acks for our own write, but someone else invalidates us?
+        // This is a race. In simple MSI, Directory handles the ordering.
+        line->state = Cache::getIState();
+        sys->network.send(Message(MessageType::ACK, cache->id, msg.sender_id, msg.address), [sys](Message m){ sys->handleMessage(m); });
+    }
     void onFwdGets(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onFwdGetm(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onPutAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
@@ -203,7 +176,10 @@ public:
     void onReplacement(Cache* cache, CacheLine* line, System* sys) override {}
     void onData(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
-    void onInv(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
+    void onInv(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
+        // Someone invalidated while we were evicting. Just ACK.
+        sys->network.send(Message(MessageType::ACK, cache->id, msg.sender_id, msg.address), [sys](Message m){ sys->handleMessage(m); });
+    }
     void onFwdGets(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
         Message resp(MessageType::DATA, cache->id, msg.sender_id, msg.address);
         resp.resolved_by = cache->level_name;
@@ -217,6 +193,7 @@ public:
     }
     void onPutAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
         line->state = Cache::getIState();
+        cache->processPendingRequests(line, sys);
     }
 };
 
@@ -236,10 +213,10 @@ public:
     void onFwdGetm(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {}
     void onPutAck(Cache* cache, CacheLine* line, System* sys, const Message& msg) override {
         line->state = Cache::getIState();
+        cache->processPendingRequests(line, sys);
     }
 };
 
-// Static instances for State Pattern
 static IState i_state;
 static SState s_state;
 static MState m_state;
